@@ -1,0 +1,21 @@
+name = "ALPHA"
+uuid = "41b9a3b0-da1d-4d91-9200-eef57ddbf7f7"
+authors = ["ProjectTorreyPines"]
+version = "1.0.0"
+
+[deps]
+GACODE = "bb074124-7a58-47ce-bd41-6b7098184f23"
+IMAS = "13ead8c1-b7d1-41bb-a6d0-5b8b65ed587a"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[compat]
+GACODE = "1"
+IMAS = "6, 7"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
