@@ -13,13 +13,15 @@ Physics ported from `\$CFS/m3739/gacode_add_d3d/Alpha`:
   * `Alpha_comp_alpha_slowing.f90` -> [`slowing_down`](@ref): classical
     slowing-down density, equivalent-Maxwellian temperature `T_alpha_equiv`, and
     cross-over energy `E_c_hat`.
-  * `Alpha_transport.f90` (stiff-CGM relaxation) -> [`integrate_crit_grad`](@ref):
-    the steady-state critical-gradient-model marginal profile that the stiff
-    relaxation solver converges to (the actual EP profile is the lower of the
-    source-limited classical profile and the transport-limited marginal profile).
+  * `Alpha_transport.f90` (stiff-CGM relaxation) -> [`stiff_cgm_transport`](@ref):
+    iterative flux-matching with stiff AE diffusivity above the TGLF-EP critical
+    gradient threshold.
+  * [`integrate_crit_grad`](@ref): analytic marginal-profile limit (fast; used when
+    `solver=:marginal`).
 
-The full time-dependent / quasilinear-diffusivity paths of the Fortran code are
-out of scope (steady state only).
+Also ported: quasi-linear EP diffusivity ([`ql_diffusivity!`](@ref)), fusion+NBI dual EP
+([`nbi_pencil_beam_source`](@ref), [`slowing_down_nbi`](@ref)), and He ash transport
+([`he_ash_transport`](@ref)).
 """
 module ALPHA
 
@@ -29,6 +31,11 @@ import IMAS
 import GACODE
 
 export run_alpha, AlphaResult, AlphaInput
+export stiff_cgm_transport, StiffCGMResult, AlphaTransportParams
+export ql_diffusivity!, QLDiffusivityState, QLDiffusivityParams, QLModeInput, default_ql_modes
+export nbi_pencil_beam_source, slowing_down_nbi, NBIBeamParams, nbi_Z1
+export he_ash_transport, HeAshParams, HeAshResult
+export integrate_crit_grad, slowing_down, load_DT_sigma_v
 
 const _DATA_DIR = normpath(joinpath(@__DIR__, "data"))
 
@@ -110,6 +117,7 @@ Base.@kwdef mutable struct AlphaInput{T<:Real}
     E_alpha::T = T(3.5)       # EP birth energy [MeV] (alpha = 3.5)
     Z1::T = T(5 // 3)         # slowing-down charge factor (5/3 for alphas in 50/50 DT)
     ln_lambda::T = T(17)      # Coulomb logarithm
+    Rmaj::Vector{T} = T[]    # major radius [m] on rho grid (filled by AlphaInput(dd) if empty)
 end
 
 """
@@ -132,7 +140,38 @@ Base.@kwdef struct AlphaResult{T<:Real}
     E_c_hat::Vector{T}          # cross-over energy E_c/E_alpha
     S0::Vector{T}               # alpha source [10^19 m^-3 s^-1]
     transport_active::Vector{Bool}  # where AE transport flattens the profile to marginal
+    # stiff-CGM diagnostics (when solver=:stiff)
+    stiff_error::T
+    stiff_n_iter::Int
+    D_alpha::Vector{T}
+    D_ql::Vector{T}
+    n_EP2::Vector{T}           # second EP species (NBI) when ep_mode=:fusion_nbi
+    n_He::Vector{T}           # helium ash when He transport enabled
 end
+
+_getgrad(crit_grad, key) = crit_grad isa AbstractDict ? get(crit_grad, key, get(crit_grad, String(key), nothing)) :
+                           (hasproperty(crit_grad, key) ? getproperty(crit_grad, key) : nothing)
+
+"""Flux-surface area dV/dr [m^2] via central differences of `volume` w.r.t. `rmin`."""
+function _dArea(volume::AbstractVector{T}, rmin::AbstractVector{T}) where {T<:Real}
+    n = length(volume)
+    area = zeros(T, n)
+    for i in 1:n
+        if i == 1
+            area[i] = (volume[2] - volume[1]) / max(rmin[2] - rmin[1], eps(T))
+        elseif i == n
+            area[i] = (volume[n] - volume[n-1]) / max(rmin[n] - rmin[n-1], eps(T))
+        else
+            area[i] = (volume[i+1] - volume[i-1]) / max(rmin[i+1] - rmin[i-1], eps(T))
+        end
+    end
+    return area
+end
+
+include("alpha_ql_diffusivity.jl")
+include("nbi_physics.jl")
+include("he_ash_transport.jl")
+include("alpha_transport.jl")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # slowing-down physics  (port of Alpha_comp_alpha_slowing.f90, NBI_flag=0 path)
@@ -227,14 +266,17 @@ function AlphaInput(dd::IMAS.dd, rho::AbstractVector{T};
     vol_eq = eqt1d.volume
 
     rhov = collect(T, rho)
+    rminv = _interp(rho_eq, rmin_eq, rhov)
+    Rmaj_eq = (eqt1d.r_inboard .+ eqt1d.r_outboard) ./ 2
     return AlphaInput{T}(;
         rho=rhov,
-        rmin=_interp(rho_eq, rmin_eq, rhov),
+        rmin=rminv,
         ne=_interp(rho_cp, ne, rhov),
         Te=_interp(rho_cp, Te, rhov),
         Ti=_interp(rho_cp, Ti, rhov),
         ni=_interp(rho_cp, ni, rhov),
         volume=_interp(rho_eq, vol_eq, rhov),
+        Rmaj=_interp(rho_eq, Rmaj_eq, rhov),
         E_alpha=T(E_alpha), Z1=T(Z1), ln_lambda=T(ln_lambda))
 end
 
@@ -242,97 +284,149 @@ end
 # public API
 # ──────────────────────────────────────────────────────────────────────────────
 """
-    run_alpha(dd, rho, crit_grad; method=:density, kwargs...) -> AlphaResult
-    run_alpha(input::AlphaInput, crit_grad; method=:density) -> AlphaResult
+    run_alpha(dd, rho, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion, kwargs...) -> AlphaResult
+    run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion) -> AlphaResult
 
 Integrate the TGLF-EP critical gradients into energetic-particle profiles.
 
-`crit_grad` provides the critical-gradient magnitude profiles on the same `rho`
-grid; it may be a `NamedTuple`/struct (or `Dict`) carrying `dndr_crit` (critical
-EP density gradient, 10^19 m^-3 per m) and/or `dpdr_crit` (critical EP pressure
-gradient, 10^19 m^-3·keV per m) -- exactly the `dndr_crit_out` / `dpdr_crit_out`
-returned by `TJLFEP.runTHD`.
+`solver`:
+  * `:stiff` -- full stiff-CGM relaxation ([`stiff_cgm_transport`](@ref); Fortran
+    `Alpha_transport.f90`). With `transport_params.use_ql_diffusivity=true`, adds
+    [`ql_diffusivity!`](@ref) each iteration.
+  * `:marginal` -- fast analytic marginal profile via [`integrate_crit_grad`](@ref)
+    and `min(classical, marginal)`.
 
-`method`:
-  * `:density`  -- integrate `dndr_crit` for the marginal density; the EP
-    temperature is the slowing-down equivalent-Maxwellian `T_alpha_equiv` and
-    `p_EP = n_EP · T_EP`.
-  * `:pressure` -- integrate `dpdr_crit` for the marginal pressure; the EP
-    temperature is `T_EP = p_EP / n_EP`.
+`ep_mode` (Fortran `NBI_flag`):
+  * `:fusion` -- fusion alphas only (`NBI_flag=0`).
+  * `:nbi` -- single NBI species (`NBI_flag=1`; uses `nbi`/`crit_grad` on primary slot).
+  * `:fusion_nbi` -- fusion alphas + pencil-beam NBI (`NBI_flag=2`).
 
-In both cases the relaxed EP profile is the lower of the source-limited classical
-slowing-down profile and the transport-limited marginal profile (critical-gradient
-model). The EP particle flux is the steady-state volume-integrated source divided
-by the flux surface; the energy flux is the convective `3/2 T_EP` estimate.
+`method` (critical-gradient variable for the stiff threshold):
+  * `:density` -- use `dndr_crit` from TJLFEP.
+  * `:pressure` -- use `dpdr_crit` from TJLFEP.
+
+`crit_grad` carries `dndr_crit` / `dpdr_crit` on the same `rho` grid as TJLFEP outputs.
+For `:fusion_nbi`, optional `dndr_crit2` / `dpdr_crit2` for the NBI species.
 """
-function run_alpha(dd::IMAS.dd, rho::AbstractVector, crit_grad; method::Symbol=:density,
+function run_alpha(dd::IMAS.dd, rho::AbstractVector, crit_grad; solver::Symbol=:stiff,
+                   method::Symbol=:density, ep_mode::Symbol=:fusion,
+                   transport_params=nothing, nbi=nothing, ql_modes=nothing,
                    E_alpha::Real=3.5, Z1::Real=5 // 3, ln_lambda::Real=17)
     input = AlphaInput(dd, rho; E_alpha, Z1, ln_lambda)
-    return run_alpha(input, crit_grad; method)
+    return run_alpha(input, crit_grad; solver, method, ep_mode, transport_params, nbi, ql_modes)
 end
 
-_getgrad(crit_grad, key) = crit_grad isa AbstractDict ? get(crit_grad, key, get(crit_grad, String(key), nothing)) :
-                           (hasproperty(crit_grad, key) ? getproperty(crit_grad, key) : nothing)
-
-function run_alpha(input::AlphaInput{T}, crit_grad; method::Symbol=:density) where {T<:Real}
+function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
+                   method::Symbol=:density, ep_mode::Symbol=:fusion,
+                   transport_params=nothing,
+                   nbi::Union{Nothing,NBIBeamParams{T}}=nothing,
+                   ql_modes=nothing) where {T<:Real}
     n_cl, T_equiv, E_c_hat, S0 = slowing_down(input.ne, input.Te, input.Ti, input.ni;
         E_alpha=input.E_alpha, Z1=input.Z1, ln_lambda=input.ln_lambda)
 
     rmin = input.rmin
 
-    # marginal (transport-limited) profile from the critical gradient
-    if method === :density
-        dndr = _as_T(T, _getgrad(crit_grad, :dndr_crit))
-        dndr === nothing && error("run_alpha(method=:density) requires `dndr_crit` in crit_grad")
-        n_marg = integrate_crit_grad(rmin, dndr)
-        n_EP = min.(n_cl, n_marg)
-        T_EP = copy(T_equiv)
+    n_EP2 = T[]
+    n_He = T[]
+    D_ql = T[]
+
+    if solver === :stiff
+        tp0 = transport_params === nothing ? AlphaTransportParams{T}() : transport_params
+        i_tot = if ep_mode === :fusion_nbi && method === :pressure
+            1
+        elseif method === :density
+            0
+        else
+            -1
+        end
+        tp = AlphaTransportParams{T}(;
+            delta0=tp0.delta0, delta1=tp0.delta1, rdelta0=tp0.rdelta0,
+            D_bkg=tp0.D_bkg, D_TAE=tp0.D_TAE, SDsink=tp0.SDsink,
+            relax=tp0.relax, relax_f=tp0.relax_f, n_iter=tp0.n_iter, tol=tp0.tol,
+            l_crit_smooth=tp0.l_crit_smooth, use_angioni_bkg=tp0.use_angioni_bkg,
+            angioni_pinch_fac=tp0.angioni_pinch_fac, angioni_negative=tp0.angioni_negative,
+            Q_fus=tp0.Q_fus, i_tot_TAE=i_tot,
+            adapt_D_TAE=tp0.adapt_D_TAE, use_ql_diffusivity=tp0.use_ql_diffusivity,
+            ql_params=tp0.ql_params, he_ash_params=tp0.he_ash_params)
+
+        nbi_p = nbi === nothing ? NBIBeamParams{T}() : nbi
+        n_cl2 = T_equiv2 = S02 = nothing
+        if ep_mode === :fusion_nbi
+            S02 = nbi_pencil_beam_source(input; nbi=nbi_p)
+            Z1n = nbi_Z1(nbi_p.M_DT)
+            n_cl2, T_equiv2, _ = slowing_down_nbi(input.ne, input.Te, S02;
+                E_nbi=nbi_p.E_nbi, Z1_nbi=Z1n, ln_lambda=input.ln_lambda, M_DT=nbi_p.M_DT)
+        elseif ep_mode === :nbi
+            S0 = nbi_pencil_beam_source(input; nbi=nbi_p)
+            n_cl, T_equiv, E_c_hat = slowing_down_nbi(input.ne, input.Te, S0;
+                E_nbi=nbi_p.E_nbi, Z1_nbi=nbi_Z1(nbi_p.M_DT), ln_lambda=input.ln_lambda, M_DT=nbi_p.M_DT)
+        end
+
+        qmodes = if ql_modes === nothing
+            dndr_q = _as_T(T, _getgrad(crit_grad, :dndr_crit))
+            dndr_q === nothing ? QLModeInput{T}[] : default_ql_modes(dndr_q; params=tp.ql_params === nothing ? QLDiffusivityParams{T}() : tp.ql_params)
+        else
+            collect(QLModeInput{T}, ql_modes)
+        end
+
+        stiff = stiff_cgm_transport(input, n_cl, T_equiv, S0, crit_grad;
+            params=tp, critgrad_method=method,
+            n_cl2=n_cl2, T_equiv2=T_equiv2, S02=S02,
+            crit_grad2=crit_grad, ql_modes=qmodes)
+        n_EP = stiff.n_tran
+        n_EP2 = stiff.n_tran2
+        T_EP = [n_EP[i] > eps(T) ? stiff.p_tran[i] / (n_EP[i] * _KEV19_TO_KPA) : T_equiv[i] for i in eachindex(n_EP)]
         p_EP = n_EP .* T_EP
-    elseif method === :pressure
-        dpdr = _as_T(T, _getgrad(crit_grad, :dpdr_crit))
-        dpdr === nothing && error("run_alpha(method=:pressure) requires `dpdr_crit` in crit_grad")
-        p_cl = n_cl .* T_equiv
-        p_marg = integrate_crit_grad(rmin, dpdr)
-        p_EP = min.(p_cl, p_marg)
-        # density still from its own marginal if available, else classical
-        dndr = _as_T(T, _getgrad(crit_grad, :dndr_crit))
-        n_EP = dndr === nothing ? copy(n_cl) : min.(n_cl, integrate_crit_grad(rmin, dndr))
-        T_EP = [n_EP[i] > 0 ? p_EP[i] / n_EP[i] : T_equiv[i] for i in eachindex(n_EP)]
+        flux_particle = stiff.flux
+        transport_active = stiff.rg_p_tran .> stiff.rg_p_th .+ eps(T)
+        D_alpha = stiff.D_alpha
+        D_ql = stiff.D_ql
+        stiff_error = stiff.error
+        stiff_n_iter = stiff.n_iter
+        if stiff.he_ash !== nothing
+            n_He = stiff.he_ash.n_He
+        end
+    elseif solver === :marginal
+        if method === :density
+            dndr = _as_T(T, _getgrad(crit_grad, :dndr_crit))
+            dndr === nothing && error("run_alpha(method=:density) requires `dndr_crit` in crit_grad")
+            n_marg = integrate_crit_grad(rmin, dndr)
+            n_EP = min.(n_cl, n_marg)
+            T_EP = copy(T_equiv)
+            p_EP = n_EP .* T_EP
+        elseif method === :pressure
+            dpdr = _as_T(T, _getgrad(crit_grad, :dpdr_crit))
+            dpdr === nothing && error("run_alpha(method=:pressure) requires `dpdr_crit` in crit_grad")
+            p_cl = n_cl .* T_equiv
+            p_marg = integrate_crit_grad(rmin, dpdr)
+            p_EP = min.(p_cl, p_marg)
+            dndr = _as_T(T, _getgrad(crit_grad, :dndr_crit))
+            n_EP = dndr === nothing ? copy(n_cl) : min.(n_cl, integrate_crit_grad(rmin, dndr))
+            T_EP = [n_EP[i] > eps(T) ? p_EP[i] / n_EP[i] : T_equiv[i] for i in eachindex(n_EP)]
+        else
+            error("run_alpha: unknown method=$method")
+        end
+        transport_active = n_EP .< (n_cl .- eps(T) * 10)
+        cumsrc = _cumtrapz(input.volume, S0)
+        area = _dArea(input.volume, rmin)
+        flux_particle = [area[i] > 0 ? cumsrc[i] / area[i] : zero(T) for i in eachindex(area)]
+        D_alpha = zeros(T, length(n_EP))
+        D_ql = zeros(T, length(n_EP))
+        stiff_error = zero(T)
+        stiff_n_iter = 0
     else
-        error("run_alpha: unknown method=$method (use :density or :pressure)")
+        error("run_alpha: unknown solver=$solver (use :stiff or :marginal)")
     end
-
-    transport_active = n_EP .< (n_cl .- eps(T) * 10)
-
-    # steady-state EP particle flux: Γ(r)·A(r) = ∫_0^r S0 dV, with A = dV/dr.
-    cumsrc = _cumtrapz(input.volume, S0)         # ∫ S0 dV  [10^19 s^-1]
-    area = _dArea(input.volume, rmin)            # dV/dr [m^2]
-    flux_particle = [area[i] > 0 ? cumsrc[i] / area[i] : zero(T) for i in eachindex(area)]
     flux_energy = T(1.5) .* T_EP .* flux_particle
 
     return AlphaResult{T}(;
         rho=collect(T, input.rho), n_EP, p_EP, T_EP,
         flux_particle, flux_energy,
-        n_classical=n_cl, T_alpha_equiv=T_equiv, E_c_hat, S0, transport_active)
+        n_classical=n_cl, T_alpha_equiv=T_equiv, E_c_hat, S0, transport_active,
+        stiff_error, stiff_n_iter, D_alpha, D_ql, n_EP2, n_He)
 end
 
 _as_T(::Type{T}, ::Nothing) where {T} = nothing
 _as_T(::Type{T}, v::AbstractVector) where {T} = collect(T, v)
-
-"""Flux-surface area dV/dr [m^2] via central differences of `volume` w.r.t. `rmin`."""
-function _dArea(volume::AbstractVector{T}, rmin::AbstractVector{T}) where {T<:Real}
-    n = length(volume)
-    area = zeros(T, n)
-    for i in 1:n
-        if i == 1
-            area[i] = (volume[2] - volume[1]) / max(rmin[2] - rmin[1], eps(T))
-        elseif i == n
-            area[i] = (volume[n] - volume[n-1]) / max(rmin[n] - rmin[n-1], eps(T))
-        else
-            area[i] = (volume[i+1] - volume[i-1]) / max(rmin[i+1] - rmin[i-1], eps(T))
-        end
-    end
-    return area
-end
 
 end # module ALPHA

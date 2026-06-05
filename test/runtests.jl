@@ -52,7 +52,7 @@ using ALPHA
 
         # critical density gradient that turns on in the mid-radius (AE drive region)
         dndr_crit = [0.2 < r < 0.8 ? 1.0 : 5.0 for r in rho]
-        res = run_alpha(input, (; dndr_crit); method=:density)
+        res = run_alpha(input, (; dndr_crit); solver=:marginal, method=:density)
 
         @test length(res.n_EP) == n
         @test all(res.n_EP .>= 0)
@@ -61,11 +61,83 @@ using ALPHA
         @test all(isfinite, res.flux_energy)
         @test all(res.T_EP .≈ res.T_alpha_equiv)          # :density => T from slowing-down
         @test any(res.transport_active)                    # some region is AE-limited
-        # pressure method
+        @test res.stiff_n_iter == 0
+        # pressure method (marginal)
         dpdr_crit = dndr_crit .* res.T_alpha_equiv
-        res2 = run_alpha(input, (; dndr_crit, dpdr_crit); method=:pressure)
+        res2 = run_alpha(input, (; dndr_crit, dpdr_crit); solver=:marginal, method=:pressure)
         @test all(res2.p_EP .>= 0)
         @test all(isfinite, res2.T_EP)
+    end
+
+    @testset "stiff_cgm_transport" begin
+        n = 31
+        rho = range(0.0, 1.0; length=n) |> collect
+        rmin = 0.6 .* rho
+        ne = 8.0 .* (1 .- 0.8 .* rho .^ 2)
+        Te = 20.0 .* (1 .- 0.9 .* rho .^ 2) .+ 0.5
+        Ti = copy(Te)
+        ni = 0.9 .* ne
+        volume = 30.0 .* rho .^ 2 .+ 1e-3
+        input = ALPHA.AlphaInput{Float64}(; rho, rmin, ne, Te, Ti, ni, volume)
+        n_cl, T_eq, _, S0 = ALPHA.slowing_down(ne, Te, Ti, ni; E_alpha=3.5, Z1=5 / 3, ln_lambda=17.0)
+        dndr_crit = [0.2 < r < 0.8 ? 0.5 : 2.0 for r in rho]
+        params = ALPHA.AlphaTransportParams{Float64}(; n_iter=500, tol=1e-2, relax=1e-3)
+        stiff = ALPHA.stiff_cgm_transport(input, n_cl, T_eq, S0, (; dndr_crit);
+            params=params, critgrad_method=:density)
+        @test stiff.n_iter > 0
+        @test stiff.error < 1.0
+        @test all(>=(0), stiff.n_tran)
+        @test all(isfinite, stiff.flux)
+        @test maximum(stiff.D_alpha) >= params.D_bkg
+
+        res = run_alpha(input, (; dndr_crit); solver=:stiff, method=:density,
+            transport_params=params)
+        @test res.stiff_n_iter > 0
+        @test res.stiff_error < 1.0
+        @test all(res.n_EP .>= 0)
+        @test all(isfinite, res.flux_particle)
+    end
+
+    @testset "ql_diffusivity (stiff-CGM coupling)" begin
+        n = 21
+        rho = range(0.0, 1.0; length=n) |> collect
+        rmin = 0.6 .* rho
+        input = ALPHA.AlphaInput{Float64}(;
+            rho, rmin,
+            ne=fill(8.0, n), Te=fill(15.0, n), Ti=fill(15.0, n), ni=fill(7.0, n),
+            volume=30.0 .* rho .^ 2, Rmaj=fill(6.2, n))
+        dndr = fill(0.5, n)
+        params = ALPHA.QLDiffusivityParams{Float64}(; km_max=3, dt_update=1e-2)
+        tp = ALPHA.AlphaTransportParams{Float64}(;
+            n_iter=300, tol=1e-2, relax=1e-3, use_ql_diffusivity=true, ql_params=params)
+        res = run_alpha(input, (; dndr_crit=dndr); solver=:stiff, transport_params=tp)
+        @test length(res.D_ql) == n
+        @test all(isfinite, res.D_ql)
+        @test res.stiff_n_iter > 0
+    end
+
+    @testset "nbi + He ash" begin
+        n = 21
+        rho = range(0.0, 1.0; length=n) |> collect
+        rmin = 0.6 .* rho
+        Rmaj = 6.2 .- 0.5 .* rmin
+        input = ALPHA.AlphaInput{Float64}(;
+            rho, rmin, Rmaj,
+            ne=8.0 .* (1 .- 0.5 .* rho), Te=20.0 .* (1 .- 0.8 .* rho) .+ 1.0,
+            Ti=fill(15.0, n), ni=fill(7.0, n), volume=40.0 .* rho .^ 2)
+        S_nbi = ALPHA.nbi_pencil_beam_source(input; nbi=ALPHA.NBIBeamParams{Float64}(; Pow_NBI=10.0))
+        @test all(S_nbi .>= 0)
+        @test any(S_nbi .> 0)
+        dndr = fill(1.0, n)
+        tp = ALPHA.AlphaTransportParams{Float64}(;
+            n_iter=200, tol=0.05, relax=1e-3,
+            he_ash_params=ALPHA.HeAshParams{Float64}(; n_iter=100, tol=0.05))
+        res = run_alpha(input, (; dndr_crit=dndr, dndr_crit2=dndr); solver=:stiff,
+            ep_mode=:fusion_nbi, transport_params=tp)
+        @test length(res.n_EP2) == n
+        @test any(res.n_EP2 .> 0)
+        @test length(res.n_He) == n
+        @test all(res.n_He .>= 0)
     end
 
 end
