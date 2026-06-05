@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+# ALPHA depends on GACODE and IMAS (registered in FuseRegistry). The first cold
+# run instantiates that dependency graph; julia-actions/cache persists the depot
+# across runs to amortize it. The test suite is pure-Julia/CPU and runs quickly.
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - "1.10"
+          - "1.11"
+        os:
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ALPHA
+
+      - uses: julia-actions/setup-julia@latest
+        with:
+          version: ${{ matrix.version }}
+
+      - uses: julia-actions/cache@v2
+
+      - name: Add FuseRegistry
+        run: |
+          rm -rf ~/.julia/registries/FuseRegistry
+          julia -e 'using Pkg; Pkg.Registry.add(RegistrySpec(url="https://github.com/ProjectTorreyPines/FuseRegistry.jl.git")); Pkg.Registry.add("General"); Pkg.Registry.update()'
+
+      - name: Replace git@github.com with https in Package.toml files
+        run: |
+          find ~/.julia/registries/FuseRegistry -type f -name 'Package.toml' -exec sed -i 's|git@github.com:|https://project-torrey-pines:${{secrets.PTP_READ_TOKEN}}@github.com/|g' {} +
+
+      - name: Instantiate
+        working-directory: ALPHA
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+      - name: Run tests
+        working-directory: ALPHA
+        run: julia --project=. test/runtests.jl
