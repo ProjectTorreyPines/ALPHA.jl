@@ -1,7 +1,7 @@
 name = "ALPHA"
 uuid = "41b9a3b0-da1d-4d91-9200-eef57ddbf7f7"
 authors = ["ProjectTorreyPines"]
-version = "1.0.1"
+version = "1.0.2"
 
 [deps]
 GACODE = "bb074124-7a58-47ce-bd41-6b7098184f23"
