@@ -116,6 +116,53 @@ using ALPHA
         @test res.stiff_n_iter > 0
     end
 
+    @testset "ITER (FUSE + TJLFEP crit grads) regression" begin
+        # Frozen fixture: FUSE :ITER background profiles (as AlphaInput(dd, rho) extracts
+        # them) + TJLFEP.runTHD critical gradients on the full rho grid. Regenerate with
+        # test/fixtures/generate_iter_fixture.jl (needs FUSE + TJLFEP). Because the inputs
+        # are frozen, the :marginal outputs below are deterministic golden values.
+        fixture = joinpath(@__DIR__, "fixtures", "iter_tjlfep.txt")
+        cols = [Float64[] for _ in 1:10]
+        for line in eachline(fixture)
+            (isempty(line) || startswith(line, "#")) && continue
+            p = split(line)
+            for j in 1:10
+                push!(cols[j], parse(Float64, p[j]))
+            end
+        end
+        rho, rmin, ne, Te, Ti, ni, volume, Rmaj, dndr_crit, dpdr_crit = cols
+        @test length(rho) == 201
+        input = ALPHA.AlphaInput{Float64}(; rho, rmin, ne, Te, Ti, ni, volume, Rmaj)
+
+        # marginal solver: analytic transport-limited profile -> deterministic regression
+        res = run_alpha(input, (; dndr_crit, dpdr_crit); solver=:marginal, method=:density)
+        @test all(isfinite, res.n_EP)
+        @test all(>=(0), res.n_EP)
+        @test all(res.n_EP .<= res.n_classical .+ 1e-9)   # transport can only flatten
+        @test all(isfinite, res.flux_particle)
+        @test all(isfinite, res.flux_energy)
+        @test all(isfinite, res.T_EP)
+        @test any(res.transport_active)                    # ITER edge crit-grad flattens somewhere
+        # golden values (inputs frozen => deterministic, pure-arithmetic marginal path)
+        @test maximum(res.n_EP) ≈ 0.1053084649712 rtol = 1e-6
+        @test sum(res.n_EP) ≈ 6.472034365065 rtol = 1e-6
+        @test res.n_EP[101] ≈ 0.01475189673948 rtol = 1e-6
+        @test maximum(res.T_EP) ≈ 998.8427884231 rtol = 1e-6
+        @test sum(res.p_EP) ≈ 6248.616489435 rtol = 1e-6
+
+        # pressure method (marginal)
+        resp = run_alpha(input, (; dndr_crit, dpdr_crit); solver=:marginal, method=:pressure)
+        @test all(>=(0), resp.p_EP)
+        @test all(isfinite, resp.T_EP)
+        @test sum(resp.p_EP) ≈ 6248.616489435 rtol = 1e-6
+
+        # stiff solver: exercise the full relaxation path on real ITER data (finite, physical)
+        ress = run_alpha(input, (; dndr_crit, dpdr_crit); solver=:stiff, method=:density)
+        @test all(isfinite, ress.n_EP)
+        @test all(>=(0), ress.n_EP)
+        @test all(isfinite, ress.flux_particle)
+    end
+
     @testset "nbi + He ash" begin
         n = 21
         rho = range(0.0, 1.0; length=n) |> collect
