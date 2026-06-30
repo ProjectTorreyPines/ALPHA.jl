@@ -1,4 +1,4 @@
-[![codecov](https://codecov.io/github/ProjectTorreyPines/ALPHA.jl/graph/badge.svg)](https://codecov.io/github/ProjectTorreyPines/ALPHA.jl)
+[![codecov](https://codecov.io/github/projecttorreypines/alpha.jl/graph/badge.svg?token=Osmi0iK6Vb)](https://codecov.io/github/projecttorreypines/alpha.jl)
 
 # ALPHA.jl
 
