@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/github/ProjectTorreyPines/ALPHA.jl/graph/badge.svg)](https://codecov.io/github/ProjectTorreyPines/ALPHA.jl)
+
 # ALPHA.jl
 
 Fast energetic-particle (EP) transport solver for TGLF-EP — a Julia port of the
