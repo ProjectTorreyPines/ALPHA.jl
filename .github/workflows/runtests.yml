@@ -5,6 +5,7 @@ on:
     branches:
       - master
   pull_request:
+  workflow_dispatch:
 
 # ALPHA depends on GACODE and IMAS (registered in FuseRegistry). The first cold
 # run instantiates that dependency graph; julia-actions/cache persists the depot
@@ -45,6 +46,19 @@ jobs:
         working-directory: ALPHA
         run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 
+      # Coverage is OFF unless --code-coverage is passed; .cov files land under ALPHA/src/.
       - name: Run tests
         working-directory: ALPHA
-        run: julia --project=. test/runtests.jl
+        run: julia --project=. --code-coverage=user test/runtests.jl
+
+      # processcoverage runs at the workspace ROOT, but the package was tested
+      # under ALPHA/, so the .cov files are in ALPHA/src/ — point it there.
+      - uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: ALPHA/src
+
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
