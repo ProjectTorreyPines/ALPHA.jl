@@ -36,6 +36,7 @@ export ql_diffusivity!, QLDiffusivityState, QLDiffusivityParams, QLModeInput, de
 export nbi_pencil_beam_source, slowing_down_nbi, NBIBeamParams, nbi_Z1
 export he_ash_transport, HeAshParams, HeAshResult
 export integrate_crit_grad, slowing_down, load_DT_sigma_v
+export read_crit_grad, load_crit_grad
 
 const _DATA_DIR = normpath(joinpath(@__DIR__, "data"))
 
@@ -94,6 +95,70 @@ function _cumtrapz(x::AbstractVector, y::AbstractVector)
         out[i] = out[i-1] + 0.5 * (y[i] + y[i-1]) * (x[i] - x[i-1])
     end
     return out
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TGLF-EP critical-gradient file readers (alpha_dndr_crit.input / alpha_dpdr_crit.input)
+# ──────────────────────────────────────────────────────────────────────────────
+"""
+    read_crit_grad(path) -> (header, values)
+
+Parse a TGLF-EP critical-gradient profile file, i.e. the `alpha_dndr_crit.input`
+/ `alpha_dpdr_crit.input` files written by TJLFEP (`TJLFEP.write_crit_grad`) or
+the Fortran `TGLFEP_driver`.
+
+The first line is the descriptive `header` (`Density critical gradient ...` /
+`Pressure critical gradient ...`); the remaining lines are the profile
+`values`.
+
+Both on-disk layouts are auto-detected:
+
+  * Fortran / current-TJLFEP format — one value per line (`F12.4`). This is the
+    format the Fortran `Alpha` solver reads.
+  * Legacy TJLFEP format — line 2 is a Julia array literal `[v1, v2, ...]`.
+"""
+function read_crit_grad(path::AbstractString)
+    lines = readlines(path)
+    isempty(lines) && error("read_crit_grad: empty file $path")
+    header = strip(lines[1])
+    body = length(lines) >= 2 ? strip(lines[2]) : ""
+    vals = Float64[]
+    if startswith(body, "[")
+        # legacy Julia array literal on a single line: [v1, v2, ...]
+        for tok in split(strip(body, ['[', ']']), ",")
+            s = strip(tok)
+            isempty(s) && continue
+            push!(vals, parse(Float64, s))
+        end
+    else
+        # Fortran F12.4 layout: one value per line after the header
+        for ln in @view lines[2:end]
+            s = strip(ln)
+            isempty(s) && continue
+            x = tryparse(Float64, s)
+            x === nothing || push!(vals, x)
+        end
+    end
+    return String(header), vals
+end
+
+"""
+    load_crit_grad(; dndr=nothing, dpdr=nothing) -> NamedTuple
+
+Read TGLF-EP critical-gradient files into the `crit_grad` argument accepted by
+[`run_alpha`](@ref). Pass the path to the density-gradient file (`dndr`,
+`alpha_dndr_crit.input`) and/or the pressure-gradient file (`dpdr`,
+`alpha_dpdr_crit.input`); a missing keyword yields a `nothing` field.
+
+    crit_grad = load_crit_grad(; dndr="alpha_dndr_crit.input",
+                                 dpdr="alpha_dpdr_crit.input")
+    run_alpha(dd, rho, crit_grad; method=:density)
+"""
+function load_crit_grad(; dndr::Union{Nothing,AbstractString}=nothing,
+                        dpdr::Union{Nothing,AbstractString}=nothing)
+    dndr_crit = dndr === nothing ? nothing : read_crit_grad(dndr)[2]
+    dpdr_crit = dpdr === nothing ? nothing : read_crit_grad(dpdr)[2]
+    return (; dndr_crit, dpdr_crit)
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
