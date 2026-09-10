@@ -3,7 +3,8 @@
 # ALPHA.jl
 
 Fast energetic-particle (EP) transport solver for TGLF-EP — a Julia port of the
-steady-state GACODE `Alpha` model.
+steady-state GACODE `Alpha` model (E. Bass), including the 2026 stiff-transport fixes of
+J. Lestz ([jlestz/Alpha](https://github.com/jlestz/Alpha)).
 
 ALPHA takes the **critical-gradient profiles** produced by
 [`TJLFEP`](https://github.com/ProjectTorreyPines/TJLFEP.jl) (`runTHD`) together
@@ -17,7 +18,7 @@ temperature `T_EP = p_EP/n_EP` — plus the associated EP particle/energy flux.
 |-------|----------|-------------|
 | Classical slowing-down (density `n_classical`, equivalent-Maxwellian `T_alpha_equiv`, cross-over energy `E_c`) | `slowing_down` | `Alpha_comp_alpha_slowing.f90` |
 | Marginal (transport-limited) profile from a critical gradient | `integrate_crit_grad` | analytic stiff-CGM limit |
-| Stiff critical-gradient (CGM) flux-matching relaxation | `stiff_cgm_transport` | `Alpha_transport.f90` |
+| Stiff critical-gradient (CGM) flux-matching relaxation | `stiff_cgm_transport` | `Alpha_transport.f90` (incl. `l_D_interface`, `l_norm_const`, tolerance/plateau exit) |
 | Quasi-linear EP diffusivity | `ql_diffusivity!` | QL-diffusivity coupling |
 | Fusion + pencil-beam NBI dual-EP source | `nbi_pencil_beam_source`, `slowing_down_nbi` | NBI source model |
 | Helium-ash transport | `he_ash_transport` | He ash model |
@@ -29,6 +30,13 @@ The top-level entry point is [`run_alpha`](#api), which orchestrates these.
 All public profiles are in tokamak-transport units: densities `10^19 m^-3`,
 temperatures `keV`, lengths `m`, pressures `10^19 m^-3 · keV`, particle flux
 `10^19 m^-2 s^-1`, energy flux `keV · 10^19 m^-2 s^-1`.
+
+Critical gradients follow the same convention: `dndr_crit` in `10^19 m^-3 / m` and
+`dpdr_crit` in `10^19 m^-3 · keV / m`. The TGLF-EP file `alpha_dpdr_crit.input` (and the
+`dpdr_crit` returned by `TJLFEP.runTHD`) is written in `10 kPa/m`; divide by `0.16022`
+(or use `load_crit_grad`, which does it for you) before passing it to `run_alpha`. The
+FUSE `ActorTJLFEP` already performs this conversion. (ALPHA < 1.1 applied the conversion in
+the wrong direction on the stiff `:pressure` path, making that threshold ~6× too high.)
 
 ## Installation
 
@@ -147,15 +155,61 @@ run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:density, ep_mode=
 plasma (ne, Te, Ti, ni, minor radius, volume, Rmaj) from an IMAS `dd` onto the
 requested `rho_tor_norm` grid.
 
+### Stiff-CGM solver options — `AlphaTransportParams`
+
+Passed as `transport_params` to `run_alpha` (or `params` to `stiff_cgm_transport`). The
+defaults reproduce the production Fortran `Alpha_transport.f90` including the 2026 fixes
+of J. Lestz:
+
+| field | default | Fortran | meaning |
+|---|---|---|---|
+| `D_interface` | `true` | `l_D_interface=1` | evaluate the stiff closure on the interface (half) grid from the one-sided gradient the recursion controls, and drive the recursion with that `D_half`; removes the grid-to-grid oscillation of `D` |
+| `norm_const` | `true` | `l_norm_const=1` | normalise the supercritical excess by the grid maximum of the reference slowing-down profile instead of its local value; removes the edge diffusivity spike (a modelling change, not only a discretisation fix) |
+| `n_iter` | `100000` | `n_up_loop` | maximum relaxation iterations |
+| `tol` | `1e-12` | `error_tol` | early exit on the relative-change error |
+| `plateau_window`, `plateau_ratio` | `10000`, `0.9` | `n_plateau_window`, `plateau_ratio_tol` | exit when the window-mean error stops decreasing (`plateau_window=0` disables) |
+| `warn_nonconverged` | `true` | — | warn when `n_iter` is exhausted |
+| `D_bkg`, `D_TAE`, `relax`, `relax_f` | `0.001`, `7.4`, `5e-4`, `0.005` | same | background/stiff diffusivities and relaxation factors |
+
+The legacy (pre-1.1) closure is recovered with
+`AlphaTransportParams(; D_interface=false, norm_const=false, tol=1e-3, n_iter=2000)`.
+`stiff_cgm_transport` additionally accepts `Vp` (flux-surface area factor ``V' = dV/dr``
+[m²]; `vprime_fortran(kappa, rmin, Rmaj)` gives the Fortran choice) and reports `D_half`,
+`converged` and `exit_reason` (`:tol`, `:plateau`, `:max_iter`) in its result.
+
+Together with `method=:pressure` (the `dpdr_crit` threshold used directly, instead of a
+critical *pressure* gradient derived from `dndr_crit` — which turns negative near the
+axis where the slowing-down density is flat and produced axial diffusivity spikes in the
+Fortran), these options remove the three pathologies found by J. Lestz in the original
+code. `method=:density` (the FUSE default) uses the density threshold directly and never
+had the axial spike.
+
 ### Output — `AlphaResult`
 
 `rho`, `n_EP`, `p_EP`, `T_EP`, `flux_particle`, `flux_energy`, plus diagnostics
 `n_classical`, `T_alpha_equiv`, `E_c_hat`, `S0`, `transport_active`, the
-stiff-CGM `stiff_error` / `stiff_n_iter` / `D_alpha` / `D_ql`, and the optional
-second-species `n_EP2` (NBI) and `n_He` (helium ash).
+stiff-CGM `stiff_error` / `stiff_n_iter` / `stiff_converged` / `stiff_exit_reason` /
+`D_alpha` / `D_ql`, and the optional second-species `n_EP2` (NBI) and `n_He` (helium ash).
+
+## Fortran parity
+
+`examples/fortran_comparison.jl` re-runs the stiff solver on the inputs of Jeff Lestz's
+reference Fortran `Alpha` runs (DIII-D 153071, t = 3400 ms "axial blow-up" and t = 2200 ms
+"edge blow-up"; parsed with `read_fortran_alpha_run`, frozen in
+`test/fixtures/d3d_153071_*_alpha.txt`) and compares against both the pre-fix and the fixed
+Fortran output. With the legacy flags ALPHA.jl reproduces the old Fortran to ~1e-10
+(including the 463 m²/s axial and 7.4 m²/s edge spikes); with the defaults it reproduces
+the fixed Fortran to ~1e-11 and exits within 0.2 % of the same iteration count. The script
+also prints the {threshold} × {`D_interface`} × {`norm_const`} attribution matrix and,
+when `Plots` is available, writes a comparison figure. These checks run in the test suite
+from the committed fixtures.
 
 ## Tests
 
 ```bash
 julia --project=. test/runtests.jl
 ```
+
+The suite includes golden-value tests of the legacy closure, closed-form checks of the
+interface/max-normalised closures, convergence-exit tests, the `dpdr_crit` unit
+convention, and the Fortran parity tests above.
