@@ -9,7 +9,8 @@ background plasma in an IMAS `dd`, and integrates the critical gradients into th
 energetic-particle radial profiles: density `n_EP`, pressure `p_EP`, temperature
 `T_EP = p_EP / n_EP`, plus the associated EP particle/energy flux.
 
-Physics ported from `\$CFS/m3739/gacode_add_d3d/Alpha`:
+Physics ported from `\$CFS/m3739/gacode_add_d3d/Alpha` (GACODE `Alpha`, E. Bass) with the
+2026 stiff-transport fixes of J. Lestz (https://github.com/jlestz/Alpha):
   * `Alpha_comp_alpha_slowing.f90` -> [`slowing_down`](@ref): classical
     slowing-down density, equivalent-Maxwellian temperature `T_alpha_equiv`, and
     cross-over energy `E_c_hat`.
@@ -37,6 +38,7 @@ export nbi_pencil_beam_source, slowing_down_nbi, NBIBeamParams, nbi_Z1
 export he_ash_transport, HeAshParams, HeAshResult
 export integrate_crit_grad, slowing_down, load_DT_sigma_v
 export read_crit_grad, load_crit_grad
+export read_fortran_alpha_run, read_alpha_fixture, vprime_fortran
 
 const _DATA_DIR = normpath(joinpath(@__DIR__, "data"))
 
@@ -143,21 +145,30 @@ function read_crit_grad(path::AbstractString)
 end
 
 """
-    load_crit_grad(; dndr=nothing, dpdr=nothing) -> NamedTuple
+    load_crit_grad(; dndr=nothing, dpdr=nothing, convert_units=true) -> NamedTuple
 
 Read TGLF-EP critical-gradient files into the `crit_grad` argument accepted by
 [`run_alpha`](@ref). Pass the path to the density-gradient file (`dndr`,
-`alpha_dndr_crit.input`) and/or the pressure-gradient file (`dpdr`,
-`alpha_dpdr_crit.input`); a missing keyword yields a `nothing` field.
+`alpha_dndr_crit.input`, 10^19 m^-3/m) and/or the pressure-gradient file (`dpdr`,
+`alpha_dpdr_crit.input`, written in 10 kPa/m); a missing keyword yields a `nothing` field.
+
+With `convert_units=true` (default) the pressure gradient is returned in the package
+convention 10^19 m^-3·keV/m (file value / 0.16022), which is what `run_alpha` and
+`stiff_cgm_transport` expect (the FUSE `ActorTJLFEP` performs the same conversion).
+`convert_units=false` returns the raw file values.
 
     crit_grad = load_crit_grad(; dndr="alpha_dndr_crit.input",
                                  dpdr="alpha_dpdr_crit.input")
-    run_alpha(dd, rho, crit_grad; method=:density)
+    run_alpha(dd, rho, crit_grad; method=:pressure)
 """
 function load_crit_grad(; dndr::Union{Nothing,AbstractString}=nothing,
-                        dpdr::Union{Nothing,AbstractString}=nothing)
+                        dpdr::Union{Nothing,AbstractString}=nothing,
+                        convert_units::Bool=true)
     dndr_crit = dndr === nothing ? nothing : read_crit_grad(dndr)[2]
     dpdr_crit = dpdr === nothing ? nothing : read_crit_grad(dpdr)[2]
+    if dpdr_crit !== nothing && convert_units
+        dpdr_crit = dpdr_crit ./ _KEV19_TO_KPA
+    end
     return (; dndr_crit, dpdr_crit)
 end
 
@@ -208,6 +219,8 @@ Base.@kwdef struct AlphaResult{T<:Real}
     # stiff-CGM diagnostics (when solver=:stiff)
     stiff_error::T
     stiff_n_iter::Int
+    stiff_converged::Bool = true
+    stiff_exit_reason::Symbol = :none   # :tol | :plateau | :max_iter | :none (marginal solver)
     D_alpha::Vector{T}
     D_ql::Vector{T}
     n_EP2::Vector{T}           # second EP species (NBI) when ep_mode=:fusion_nbi
@@ -237,6 +250,7 @@ include("alpha_ql_diffusivity.jl")
 include("nbi_physics.jl")
 include("he_ash_transport.jl")
 include("alpha_transport.jl")
+include("fortran_alpha_io.jl")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # slowing-down physics  (port of Alpha_comp_alpha_slowing.f90, NBI_flag=0 path)
@@ -370,8 +384,13 @@ Integrate the TGLF-EP critical gradients into energetic-particle profiles.
   * `:density` -- use `dndr_crit` from TJLFEP.
   * `:pressure` -- use `dpdr_crit` from TJLFEP.
 
-`crit_grad` carries `dndr_crit` / `dpdr_crit` on the same `rho` grid as TJLFEP outputs.
-For `:fusion_nbi`, optional `dndr_crit2` / `dpdr_crit2` for the NBI species.
+`crit_grad` carries `dndr_crit` [10^19 m^-3/m] / `dpdr_crit` [10^19 m^-3·keV/m] on the same
+`rho` grid as TJLFEP outputs (the `alpha_dpdr_crit.input` file is 10 kPa/m: use
+[`load_crit_grad`](@ref) or divide by 0.16022). For `:fusion_nbi`, optional `dndr_crit2` /
+`dpdr_crit2` for the NBI species.
+
+Stiff-solver options (interface-grid closure, max-normalisation, convergence) are set through
+`transport_params::AlphaTransportParams`; see [`AlphaTransportParams`](@ref).
 """
 function run_alpha(dd::IMAS.dd, rho::AbstractVector, crit_grad; solver::Symbol=:stiff,
                    method::Symbol=:density, ep_mode::Symbol=:fusion,
@@ -404,15 +423,7 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         else
             -1
         end
-        tp = AlphaTransportParams{T}(;
-            delta0=tp0.delta0, delta1=tp0.delta1, rdelta0=tp0.rdelta0,
-            D_bkg=tp0.D_bkg, D_TAE=tp0.D_TAE, SDsink=tp0.SDsink,
-            relax=tp0.relax, relax_f=tp0.relax_f, n_iter=tp0.n_iter, tol=tp0.tol,
-            l_crit_smooth=tp0.l_crit_smooth, use_angioni_bkg=tp0.use_angioni_bkg,
-            angioni_pinch_fac=tp0.angioni_pinch_fac, angioni_negative=tp0.angioni_negative,
-            Q_fus=tp0.Q_fus, i_tot_TAE=i_tot,
-            adapt_D_TAE=tp0.adapt_D_TAE, use_ql_diffusivity=tp0.use_ql_diffusivity,
-            ql_params=tp0.ql_params, he_ash_params=tp0.he_ash_params)
+        tp = _with(tp0; i_tot_TAE=i_tot)
 
         nbi_p = nbi === nothing ? NBIBeamParams{T}() : nbi
         n_cl2 = T_equiv2 = S02 = nothing
@@ -448,6 +459,8 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         D_ql = stiff.D_ql
         stiff_error = stiff.error
         stiff_n_iter = stiff.n_iter
+        stiff_converged = stiff.converged
+        stiff_exit_reason = stiff.exit_reason
         if stiff.he_ash !== nothing
             n_He = stiff.he_ash.n_He
         end
@@ -479,6 +492,8 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         D_ql = zeros(T, length(n_EP))
         stiff_error = zero(T)
         stiff_n_iter = 0
+        stiff_converged = true
+        stiff_exit_reason = :none
     else
         error("run_alpha: unknown solver=$solver (use :stiff or :marginal)")
     end
@@ -488,7 +503,7 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         rho=collect(T, input.rho), n_EP, p_EP, T_EP,
         flux_particle, flux_energy,
         n_classical=n_cl, T_alpha_equiv=T_equiv, E_c_hat, S0, transport_active,
-        stiff_error, stiff_n_iter, D_alpha, D_ql, n_EP2, n_He)
+        stiff_error, stiff_n_iter, stiff_converged, stiff_exit_reason, D_alpha, D_ql, n_EP2, n_He)
 end
 
 _as_T(::Type{T}, ::Nothing) where {T} = nothing
