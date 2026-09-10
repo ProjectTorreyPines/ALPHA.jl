@@ -49,7 +49,7 @@ function solve(c, thr::Symbol, D_interface::Bool, norm_const::Bool; n_iter=100_0
     input = ALPHA.AlphaInput{Float64}(; rho=c.rho, rmin=c.rmin, Rmaj=c.Rmaj,
         ne=ones(n), Te=ones(n), Ti=ones(n), ni=ones(n), volume=zeros(n))
     params = ALPHA.AlphaTransportParams{Float64}(; COMMON..., D_interface, norm_const, n_iter, tol, plateau_window)
-    crit = thr === :density ? (; dndr_crit=min.(c.dndr, 1000.0)) : (; dpdr_crit=min.(c.dpdr, 1000.0) ./ 0.16022)
+    crit = thr === :density ? (; dndr_crit=min.(c.dndr, 1000.0)) : (; dpdr_crit=min.(c.dpdr, 1000.0))
     return ALPHA.stiff_cgm_transport(input, c.n_cl, c.T_equiv, c.S0, crit; params, critgrad_method=thr, Vp=c.Vp)
 end
 

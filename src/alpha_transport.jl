@@ -139,9 +139,9 @@ function _threshold_gradients(
         rg_p_th[n] = rg_p_th[n-1]
     elseif critgrad_method === :pressure
         dpdr_crit === nothing && error("critgrad_method=:pressure requires dpdr_crit")
-        # dpdr_crit is in the package convention 10^19 m^-3·keV/m (TJLFEP file value / 0.16022);
-        # internal pressures/gradients are 10 kPa (= n[10^19]*T[keV]*0.16022), like the Fortran
-        rg_p_th .= dpdr_crit .* _KEV19_TO_KPA
+        # dpdr_crit is the TGLF-EP file value (10 kPa/m); the internal pressures/gradients are in
+        # the same units (n[10^19]*T[keV]*0.16022), so it is applied as is, like the Fortran does
+        rg_p_th .= dpdr_crit
         dndr_crit === nothing || (rg_n_th .= dndr_crit)
     else
         error("unknown critgrad_method=$critgrad_method")
@@ -207,8 +207,8 @@ end
 
 Stiff CGM relaxation port of `Alpha_transport.f90` (inward integration from the edge).
 
-`crit_grad` supplies `dndr_crit` [10^19 m^-3/m] and/or `dpdr_crit` [10^19 m^-3·keV/m]
-(TJLFEP outputs; the pressure file value is 10 kPa/m = package value × 0.16022). Use
+`crit_grad` supplies `dndr_crit` [10^19 m^-3/m] and/or `dpdr_crit` [10 kPa/m], the TGLF-EP
+file values (`alpha_dndr_crit.input` / `alpha_dpdr_crit.input`, `TJLFEP.runTHD`) as is. Use
 `critgrad_method=:density` or `:pressure` to select the threshold branch; `params.i_tot_TAE`
 selects the transported quantity whose excess gradient drives the stiff diffusivity.
 

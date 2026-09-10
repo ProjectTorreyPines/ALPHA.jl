@@ -145,32 +145,24 @@ function read_crit_grad(path::AbstractString)
 end
 
 """
-    load_crit_grad(; dndr=nothing, dpdr=nothing, convert_units=true) -> NamedTuple
+    load_crit_grad(; dndr=nothing, dpdr=nothing) -> NamedTuple
 
 Read TGLF-EP critical-gradient files into the `crit_grad` argument accepted by
 [`run_alpha`](@ref). Pass the path to the density-gradient file (`dndr`,
 `alpha_dndr_crit.input`, 10^19 m^-3/m) and/or the pressure-gradient file (`dpdr`,
-`alpha_dpdr_crit.input`, written in 10 kPa/m); a missing keyword yields a `nothing` field.
-
-With `convert_units=true` (default) the pressure gradient is returned in the package
-convention 10^19 m^-3·keV/m (file value / 0.16022), which is what `run_alpha` and
-`stiff_cgm_transport` expect (the FUSE `ActorTJLFEP` performs the same conversion).
-`convert_units=false` returns the raw file values. The Fortran `Alpha` reads the file
-without any conversion because its internal pressures are in 10 kPa as well; ALPHA.jl
-multiplies the package value back by 0.16022 internally, so both see the same threshold.
+`alpha_dpdr_crit.input`, 10 kPa/m); a missing keyword yields a `nothing` field. The values
+are returned as written: ALPHA takes the critical gradients in the file units, exactly as the
+Fortran `Alpha` does (no unit conversion anywhere; before ALPHA 2.0 `dpdr_crit` had to be
+divided by 0.16022).
 
     crit_grad = load_crit_grad(; dndr="alpha_dndr_crit.input",
                                  dpdr="alpha_dpdr_crit.input")
     run_alpha(dd, rho, crit_grad; method=:pressure)
 """
 function load_crit_grad(; dndr::Union{Nothing,AbstractString}=nothing,
-                        dpdr::Union{Nothing,AbstractString}=nothing,
-                        convert_units::Bool=true)
+                        dpdr::Union{Nothing,AbstractString}=nothing)
     dndr_crit = dndr === nothing ? nothing : read_crit_grad(dndr)[2]
     dpdr_crit = dpdr === nothing ? nothing : read_crit_grad(dpdr)[2]
-    if dpdr_crit !== nothing && convert_units
-        dpdr_crit = dpdr_crit ./ _KEV19_TO_KPA
-    end
     return (; dndr_crit, dpdr_crit)
 end
 
@@ -392,10 +384,11 @@ Integrate the TGLF-EP critical gradients into energetic-particle profiles.
     slowing-down density is flat or hollow (it caused the axial diffusivity spikes found by
     J. Lestz in the Fortran).
 
-`crit_grad` carries `dndr_crit` [10^19 m^-3/m] / `dpdr_crit` [10^19 m^-3·keV/m] on the same
-`rho` grid as TJLFEP outputs (the `alpha_dpdr_crit.input` file is 10 kPa/m: use
-[`load_crit_grad`](@ref) or divide by 0.16022). For `:fusion_nbi`, optional `dndr_crit2` /
-`dpdr_crit2` for the NBI species.
+`crit_grad` carries `dndr_crit` [10^19 m^-3/m] / `dpdr_crit` [10 kPa/m] on the same `rho`
+grid as TJLFEP outputs, in the TGLF-EP file units (`alpha_dndr_crit.input` /
+`alpha_dpdr_crit.input`, or `TJLFEP.runTHD`) with no conversion, as the Fortran `Alpha`
+takes them ([`load_crit_grad`](@ref) reads the files). For `:fusion_nbi`, optional
+`dndr_crit2` / `dpdr_crit2` for the NBI species.
 
 Stiff-solver options (interface-grid closure, max-normalisation, convergence) are set through
 `transport_params::AlphaTransportParams`; see [`AlphaTransportParams`](@ref).
@@ -415,7 +408,7 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
                    ql_modes=nothing) where {T<:Real}
     method === :pressure && _getgrad(crit_grad, :dpdr_crit) === nothing &&
         throw(ArgumentError("run_alpha(method=:pressure) requires `dpdr_crit` in crit_grad " *
-            "(TGLF-EP alpha_dpdr_crit.input / 0.16022, see load_crit_grad), or pass method=:density"))
+            "(the TGLF-EP alpha_dpdr_crit.input values, see load_crit_grad), or pass method=:density"))
     n_cl, T_equiv, E_c_hat, S0 = slowing_down(input.ne, input.Te, input.Ti, input.ni;
         E_alpha=input.E_alpha, Z1=input.Z1, ln_lambda=input.ln_lambda)
 
@@ -486,7 +479,7 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         elseif method === :pressure
             dpdr = _as_T(T, _getgrad(crit_grad, :dpdr_crit))
             p_cl = n_cl .* T_equiv
-            p_marg = integrate_crit_grad(rmin, dpdr)
+            p_marg = integrate_crit_grad(rmin, dpdr) ./ _KEV19_TO_KPA   # dpdr [10 kPa/m] -> p [10^19 m^-3·keV]
             p_EP = min.(p_cl, p_marg)
             dndr = _as_T(T, _getgrad(crit_grad, :dndr_crit))
             n_EP = dndr === nothing ? copy(n_cl) : min.(n_cl, integrate_crit_grad(rmin, dndr))

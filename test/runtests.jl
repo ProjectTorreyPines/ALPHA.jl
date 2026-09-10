@@ -63,7 +63,7 @@ using ALPHA
         @test any(res.transport_active)                    # some region is AE-limited
         @test res.stiff_n_iter == 0
         # pressure method (marginal)
-        dpdr_crit = dndr_crit .* res.T_alpha_equiv
+        dpdr_crit = dndr_crit .* res.T_alpha_equiv .* 0.16022   # file units, 10 kPa/m
         res2 = run_alpha(input, (; dndr_crit, dpdr_crit); solver=:marginal, method=:pressure)
         @test all(res2.p_EP .>= 0)
         @test all(isfinite, res2.T_EP)
@@ -130,8 +130,7 @@ using ALPHA
                 push!(cols[j], parse(Float64, p[j]))
             end
         end
-        rho, rmin, ne, Te, Ti, ni, volume, Rmaj, dndr_crit, dpdr_crit = cols
-        dpdr_crit = dpdr_crit ./ 0.16022   # fixture stores the raw TJLFEP value (10 kPa/m); ALPHA wants 10^19 m^-3·keV/m
+        rho, rmin, ne, Te, Ti, ni, volume, Rmaj, dndr_crit, dpdr_crit = cols   # raw TJLFEP values (dpdr in 10 kPa/m), as ALPHA takes them
         @test length(rho) == 201
         input = ALPHA.AlphaInput{Float64}(; rho, rmin, ne, Te, Ti, ni, volume, Rmaj)
 
@@ -224,7 +223,7 @@ using ALPHA
     @testset "single-iteration closure formulas" begin
         input, n_cl, T_eq, S0, dndr = _synth_case(31)
         rho = input.rho; a = input.rmin[end]; n = length(rho)
-        dpdr = dndr .* T_eq            # package units 10^19 keV/m -> threshold = dpdr*0.16022 in 10 kPa/m
+        dpdr = dndr .* T_eq .* 0.16022  # file units 10 kPa/m = the threshold the solver applies as is
         base = (; n_iter=1, relax_f=1.0, tol=0.0, plateau_window=0, warn_nonconverged=false, l_crit_smooth=false)
         n0 = n_cl .* (1 .+ 0.01 .* (rho .- 0.5) ./ 0.5); n0[end] = 0.0
         g0 = ALPHA._radial_grad(n0, rho, a)
@@ -244,16 +243,16 @@ using ALPHA
             @test st.D_alpha[1] == st.D_half[1]
             @test st.D_alpha[end] == st.D_half[end]
             @test st.D_alpha[2:end-1] ≈ 0.5 .* (Dh[1:end-1] .+ Dh[2:end]) rtol = 1e-12
-            # point + interface closure, pressure threshold (units: dpdr*0.16022)
+            # point + interface closure, pressure threshold (file units, no conversion)
             st = ALPHA.stiff_cgm_transport(input, n_cl, T_eq, S0, (; dpdr_crit=dpdr);
                 params=ALPHA.AlphaTransportParams{Float64}(; i_tot_TAE=-1, D_interface=false, norm_const, base...), critgrad_method=:pressure)
-            @test st.rg_p_th ≈ dpdr .* 0.16022
-            @test st.D_alpha ≈ 0.001 .+ 7.4 .* max.(gp0 .- dpdr .* 0.16022, 0.0) .* a ./ den_p rtol = 1e-12
+            @test st.rg_p_th == dpdr
+            @test st.D_alpha ≈ 0.001 .+ 7.4 .* max.(gp0 .- dpdr, 0.0) .* a ./ den_p rtol = 1e-12
             st = ALPHA.stiff_cgm_transport(input, n_cl, T_eq, S0, (; dpdr_crit=dpdr);
                 params=ALPHA.AlphaTransportParams{Float64}(; i_tot_TAE=-1, D_interface=true, norm_const, base...), critgrad_method=:pressure)
             ghp = [(n0[i] * T_eq[i] - n0[i+1] * T_eq[i+1]) * 0.16022 / a / (rho[i+1] - rho[i]) for i in 1:n-1]
-            thp = dpdr .* 0.16022
-            Dhp = [0.001 + 7.4 * max(ghp[i] - 0.5 * (thp[i] + thp[i+1]), 0.0) * a / (0.5 * (den_p[i] + den_p[i+1])) for i in 1:n-1]
+            thp = dpdr
+            Dhp =[0.001 + 7.4 * max(ghp[i] - 0.5 * (thp[i] + thp[i+1]), 0.0) * a / (0.5 * (den_p[i] + den_p[i+1])) for i in 1:n-1]
             @test st.D_half ≈ Dhp rtol = 1e-12
         end
     end
@@ -302,7 +301,7 @@ using ALPHA
         input, n_cl, _, S0, dndr = _synth_case(31)
         n = length(dndr)
         T_flat = fill(500.0, n)
-        dpdr = dndr .* T_flat        # 10^19 keV/m; same problem as the density threshold up to a constant
+        dpdr = dndr .* T_flat .* 0.16022   # 10 kPa/m (file units); same problem as the density threshold up to a constant
         p = (; n_iter=3000, tol=0.0, plateau_window=0, warn_nonconverged=false, l_crit_smooth=false)
         for nc in (false, true)
             sd = ALPHA.stiff_cgm_transport(input, n_cl, T_flat, S0, (; dndr_crit=dndr);
@@ -324,10 +323,10 @@ using ALPHA
             end
             cg = ALPHA.load_crit_grad(; dndr=joinpath(dir, "alpha_dndr_crit.input"), dpdr=joinpath(dir, "alpha_dpdr_crit.input"))
             @test cg.dndr_crit == vals
-            @test cg.dpdr_crit ≈ vals ./ 0.16022
-            raw = ALPHA.load_crit_grad(; dpdr=joinpath(dir, "alpha_dpdr_crit.input"), convert_units=false)
-            @test raw.dpdr_crit == vals
-            @test raw.dndr_crit === nothing
+            @test cg.dpdr_crit == vals          # file units, no conversion
+            only_p = ALPHA.load_crit_grad(; dpdr=joinpath(dir, "alpha_dpdr_crit.input"))
+            @test only_p.dpdr_crit == vals
+            @test only_p.dndr_crit === nothing
         end
     end
 
@@ -380,7 +379,7 @@ using ALPHA
             input = ALPHA.AlphaInput{Float64}(; rho=fx.rho, rmin=fx.rmin, Rmaj=fx.Rmaj,
                 ne=ones(n), Te=ones(n), Ti=ones(n), ni=ones(n), volume=zeros(n))
             dndr = min.(fx.dndr, 1000.0)
-            dpdr = min.(fx.dpdr, 1000.0) ./ 0.16022
+            dpdr = min.(fx.dpdr, 1000.0)     # file value, capped like the Fortran composite
             axis = fx.rho .< 0.05; edge = fx.rho .> 0.9
             # old scheme: dndr-derived pressure threshold, point closure, local normalisation, exactly 10000 iterations
             po = ALPHA.AlphaTransportParams{Float64}(; D_interface=false, norm_const=false, n_iter=fx.meta[:old_n_iter], tol=0.0, common...)
@@ -456,7 +455,7 @@ using ALPHA
         act = ALPHA._transport_active(sd, 0)
         @test !any(act[ax])
         @test act == (sd.rg_n_tran .> sd.rg_n_th .+ eps())
-        sp = ALPHA.stiff_cgm_transport(inp, fx.n_cl, fx.T_equiv, fx.S0, (; dpdr_crit=min.(fx.dpdr, 1000.0) ./ 0.16022);
+        sp = ALPHA.stiff_cgm_transport(inp, fx.n_cl, fx.T_equiv, fx.S0, (; dpdr_crit=min.(fx.dpdr, 1000.0));
             params=ALPHA.AlphaTransportParams{Float64}(; i_tot_TAE=-1, common...), critgrad_method=:pressure, Vp=fx.Vp)
         @test ALPHA._transport_active(sp, -1) == (sp.rg_p_tran .> sp.rg_p_th .+ eps())
         @test !any(ALPHA._transport_active(sp, -1)[ax])

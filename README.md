@@ -31,18 +31,14 @@ All public profiles are in tokamak-transport units: densities `10^19 m^-3`,
 temperatures `keV`, lengths `m`, pressures `10^19 m^-3 · keV`, particle flux
 `10^19 m^-2 s^-1`, energy flux `keV · 10^19 m^-2 s^-1`.
 
-Critical gradients follow the same convention: `dndr_crit` in `10^19 m^-3 / m` and
-`dpdr_crit` in `10^19 m^-3 · keV / m`. The TGLF-EP file `alpha_dpdr_crit.input` (and the
-`dpdr_crit` returned by `TJLFEP.runTHD`) is written in `10 kPa/m`; divide by `0.16022`
-(or use `load_crit_grad`, which does it for you) before passing it to `run_alpha`. The
-FUSE `ActorTJLFEP` already performs this conversion.
-
-This is bookkeeping at the Julia interface only. The Fortran `Alpha` reads
-`alpha_dpdr_crit.input` without any conversion because its internal pressures are also in
-10 kPa (`n·T·0.16022`), and so are ALPHA.jl's internal ones: the stiff solver multiplies the
-public value back by `0.16022`, so the threshold it applies is exactly the file value.
-(ALPHA < 1.1 divided instead of multiplying on the stiff `:pressure` path, making that
-threshold ~6× too high against the file and ~39× too high in FUSE.)
+The critical gradients are the exception: they are taken in the **TGLF-EP file units**, with
+no conversion, exactly as the Fortran `Alpha` reads them — `dndr_crit` in `10^19 m^-3 / m`
+(`alpha_dndr_crit.input`) and `dpdr_crit` in `10 kPa / m` (`alpha_dpdr_crit.input`; the
+`dpdr_crit` returned by `TJLFEP.runTHD` is the same quantity). Hand the file values, or
+`runTHD`'s output, straight to `run_alpha`; `load_crit_grad` reads the files. Internally the
+stiff solver works in 10 kPa (`n·T·0.16022`) like the Fortran, so the pressure threshold it
+applies is the file value itself. (ALPHA 1.x expected `dpdr_crit` divided by 0.16022 and, in
+1.0, divided it again on the stiff path, making that threshold ~6× / ~39× too high.)
 
 ## Installation
 
@@ -123,7 +119,6 @@ _, _, SFmin, dpdr_crit, dndr_crit = runTHD(dd, rho_scan, OptionsDict; use_gpu=fa
 
 # 3. ALPHA integrates the critical gradients into EP profiles
 rho_full = collect(dd.core_profiles.profiles_1d[].grid.rho_tor_norm)
-dpdr_crit = dpdr_crit ./ 0.16022   # TGLF-EP file units (10 kPa/m) -> 10^19 m^-3·keV/m
 res = run_alpha(dd, rho_full, (; dndr_crit, dpdr_crit); solver=:stiff, method=:pressure)
 ```
 
@@ -152,7 +147,7 @@ run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:pressure, ep_mode
   - `:marginal` — fast analytic marginal profile (`integrate_crit_grad`) and
     `min(classical, marginal)`.
 - `method` — critical-gradient variable for the stiff threshold:
-  - `:pressure` (default, since 1.2) — EP pressure-gradient drive against `dpdr_crit`, the
+  - `:pressure` (default) — EP pressure-gradient drive against `dpdr_crit`, the
     TGLF-EP `alpha_dpdr_crit.input` threshold used as is (Fortran `i_tot_TAE=-1` with the
     dpdr file). This is the standard way to run Alpha.
   - `:density` — EP density-gradient drive against `dndr_crit` (Fortran `i_tot_TAE=0`),
