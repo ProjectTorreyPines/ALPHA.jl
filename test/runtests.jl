@@ -110,7 +110,7 @@ using ALPHA
         params = ALPHA.QLDiffusivityParams{Float64}(; km_max=3, dt_update=1e-2)
         tp = ALPHA.AlphaTransportParams{Float64}(;
             n_iter=300, tol=1e-2, relax=1e-3, use_ql_diffusivity=true, ql_params=params, warn_nonconverged=false)
-        res = run_alpha(input, (; dndr_crit=dndr); solver=:stiff, transport_params=tp)
+        res = run_alpha(input, (; dndr_crit=dndr); solver=:stiff, method=:density, transport_params=tp)
         @test length(res.D_ql) == n
         @test all(isfinite, res.D_ql)
         @test res.stiff_n_iter > 0
@@ -213,7 +213,7 @@ using ALPHA
             ni=fill(7.0, n), volume=30.0 .* rho .^ 2, Rmaj=fill(6.2, n))
         tp = ALPHA.AlphaTransportParams{Float64}(; n_iter=300, use_ql_diffusivity=true,
             ql_params=ALPHA.QLDiffusivityParams{Float64}(; km_max=3, dt_update=1e-2), LEGACY...)
-        res = run_alpha(inp, (; dndr_crit=fill(0.5, n)); solver=:stiff, transport_params=tp)
+        res = run_alpha(inp, (; dndr_crit=fill(0.5, n)); solver=:stiff, method=:density, transport_params=tp)
         @test sum(res.n_EP) ≈ 0.40524463586310783 rtol = 1e-13
         @test maximum(res.D_alpha) ≈ 32.284886714474901 rtol = 1e-13
         @test res.stiff_error ≈ 0.93996011726022455 rtol = 1e-13
@@ -422,6 +422,46 @@ using ALPHA
         end
     end
 
+    @testset "default method (:pressure) and transport_active drive variable" begin
+        n = 31
+        rho = collect(range(0.0, 1.0; length=n))
+        input = ALPHA.AlphaInput{Float64}(; rho, rmin=0.6 .* rho, ne=8.0 .* (1 .- 0.8 .* rho .^ 2),
+            Te=20.0 .* (1 .- 0.9 .* rho .^ 2) .+ 0.5, Ti=20.0 .* (1 .- 0.9 .* rho .^ 2) .+ 0.5,
+            ni=7.2 .* (1 .- 0.8 .* rho .^ 2), volume=30.0 .* rho .^ 2 .+ 1e-3)
+        dndr_crit = [0.2 < r < 0.8 ? 0.5 : 2.0 for r in rho]
+        # the default is the pressure drive: without dpdr_crit it asks for it (both solvers)
+        @test_throws ArgumentError run_alpha(input, (; dndr_crit); solver=:stiff)
+        @test_throws ArgumentError run_alpha(input, (; dndr_crit); solver=:marginal)
+        dpdr_crit = 2.0 .* dndr_crit
+        tp = ALPHA.AlphaTransportParams{Float64}(; n_iter=500, tol=0.0, plateau_window=0, warn_nonconverged=false)
+        rd = run_alpha(input, (; dndr_crit, dpdr_crit); transport_params=tp)
+        rp = run_alpha(input, (; dndr_crit, dpdr_crit); method=:pressure, transport_params=tp)
+        @test rd.n_EP == rp.n_EP && rd.D_alpha == rp.D_alpha
+
+        # transport_active follows the drive variable. DIII-D 153071 t=3400 (jlestz): the
+        # pressure threshold derived from dndr_crit is negative at the axis, where the density
+        # drive is subcritical (D = D_bkg); the old flag rg_p_tran > rg_p_th marked it active.
+        fx = ALPHA.read_alpha_fixture(joinpath(@__DIR__, "fixtures", "d3d_153071_3400_alpha.txt"))
+        m = length(fx.rho)
+        inp = ALPHA.AlphaInput{Float64}(; rho=fx.rho, rmin=fx.rmin, Rmaj=fx.Rmaj,
+            ne=ones(m), Te=ones(m), Ti=ones(m), ni=ones(m), volume=zeros(m))
+        common = (; D_bkg=0.001, D_TAE=7.4, relax=5e-4, relax_f=0.005, delta0=0.01, delta1=0.0, rdelta0=0.5,
+            SDsink=1.0, plateau_window=0, warn_nonconverged=false)
+        sd = ALPHA.stiff_cgm_transport(inp, fx.n_cl, fx.T_equiv, fx.S0, (; dndr_crit=min.(fx.dndr, 1000.0));
+            params=ALPHA.AlphaTransportParams{Float64}(; i_tot_TAE=0, common...), critgrad_method=:density, Vp=fx.Vp)
+        ax = 2:4
+        @test all(sd.rg_p_th[ax] .< 0)
+        @test all(sd.D_alpha[ax] .== 0.001)
+        @test all(sd.rg_p_tran[ax] .> sd.rg_p_th[ax])            # old criterion: spurious
+        act = ALPHA._transport_active(sd, 0)
+        @test !any(act[ax])
+        @test act == (sd.rg_n_tran .> sd.rg_n_th .+ eps())
+        sp = ALPHA.stiff_cgm_transport(inp, fx.n_cl, fx.T_equiv, fx.S0, (; dpdr_crit=min.(fx.dpdr, 1000.0) ./ 0.16022);
+            params=ALPHA.AlphaTransportParams{Float64}(; i_tot_TAE=-1, common...), critgrad_method=:pressure, Vp=fx.Vp)
+        @test ALPHA._transport_active(sp, -1) == (sp.rg_p_tran .> sp.rg_p_th .+ eps())
+        @test !any(ALPHA._transport_active(sp, -1)[ax])
+    end
+
     @testset "nbi + He ash" begin
         n = 21
         rho = range(0.0, 1.0; length=n) |> collect
@@ -438,7 +478,7 @@ using ALPHA
         tp = ALPHA.AlphaTransportParams{Float64}(;
             n_iter=200, tol=0.05, relax=1e-3, warn_nonconverged=false,
             he_ash_params=ALPHA.HeAshParams{Float64}(; n_iter=100, tol=0.05))
-        res = run_alpha(input, (; dndr_crit=dndr, dndr_crit2=dndr); solver=:stiff,
+        res = run_alpha(input, (; dndr_crit=dndr, dndr_crit2=dndr); solver=:stiff, method=:density,
             ep_mode=:fusion_nbi, transport_params=tp)
         @test length(res.n_EP2) == n
         @test any(res.n_EP2 .> 0)

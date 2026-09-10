@@ -35,8 +35,14 @@ Critical gradients follow the same convention: `dndr_crit` in `10^19 m^-3 / m` a
 `dpdr_crit` in `10^19 m^-3 · keV / m`. The TGLF-EP file `alpha_dpdr_crit.input` (and the
 `dpdr_crit` returned by `TJLFEP.runTHD`) is written in `10 kPa/m`; divide by `0.16022`
 (or use `load_crit_grad`, which does it for you) before passing it to `run_alpha`. The
-FUSE `ActorTJLFEP` already performs this conversion. (ALPHA < 1.1 applied the conversion in
-the wrong direction on the stiff `:pressure` path, making that threshold ~6× too high.)
+FUSE `ActorTJLFEP` already performs this conversion.
+
+This is bookkeeping at the Julia interface only. The Fortran `Alpha` reads
+`alpha_dpdr_crit.input` without any conversion because its internal pressures are also in
+10 kPa (`n·T·0.16022`), and so are ALPHA.jl's internal ones: the stiff solver multiplies the
+public value back by `0.16022`, so the threshold it applies is exactly the file value.
+(ALPHA < 1.1 divided instead of multiplying on the stiff `:pressure` path, making that
+threshold ~6× too high against the file and ~39× too high in FUSE.)
 
 ## Installation
 
@@ -117,7 +123,8 @@ _, _, SFmin, dpdr_crit, dndr_crit = runTHD(dd, rho_scan, OptionsDict; use_gpu=fa
 
 # 3. ALPHA integrates the critical gradients into EP profiles
 rho_full = collect(dd.core_profiles.profiles_1d[].grid.rho_tor_norm)
-res = run_alpha(dd, rho_full, (; dndr_crit, dpdr_crit); solver=:stiff, method=:density)
+dpdr_crit = dpdr_crit ./ 0.16022   # TGLF-EP file units (10 kPa/m) -> 10^19 m^-3·keV/m
+res = run_alpha(dd, rho_full, (; dndr_crit, dpdr_crit); solver=:stiff, method=:pressure)
 ```
 
 `runTHD(dd, rho, OptionsDict)` returns
@@ -135,8 +142,8 @@ is exactly the grid `run_alpha(dd, rho_full, …)` expects.
 ## API
 
 ```julia
-run_alpha(dd::IMAS.dd, rho, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion, kwargs...)
-run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion)
+run_alpha(dd::IMAS.dd, rho, crit_grad; solver=:stiff, method=:pressure, ep_mode=:fusion, kwargs...)
+run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:pressure, ep_mode=:fusion)
 ```
 
 - `solver`
@@ -144,8 +151,12 @@ run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:density, ep_mode=
     `transport_params.use_ql_diffusivity=true` adds `ql_diffusivity!` each iteration.
   - `:marginal` — fast analytic marginal profile (`integrate_crit_grad`) and
     `min(classical, marginal)`.
-- `method` — critical-gradient variable for the stiff threshold: `:density`
-  (`dndr_crit`) or `:pressure` (`dpdr_crit`).
+- `method` — critical-gradient variable for the stiff threshold:
+  - `:pressure` (default, since 1.2) — EP pressure-gradient drive against `dpdr_crit`, the
+    TGLF-EP `alpha_dpdr_crit.input` threshold used as is (Fortran `i_tot_TAE=-1` with the
+    dpdr file). This is the standard way to run Alpha.
+  - `:density` — EP density-gradient drive against `dndr_crit` (Fortran `i_tot_TAE=0`),
+    kept for comparison.
 - `ep_mode` (Fortran `NBI_flag`): `:fusion` (alphas only), `:nbi` (single NBI
   species), `:fusion_nbi` (fusion alphas + pencil-beam NBI).
 - `crit_grad` — a `NamedTuple`/`Dict` carrying `dndr_crit` / `dpdr_crit` (and
@@ -177,12 +188,13 @@ The legacy (pre-1.1) closure is recovered with
 [m²]; `vprime_fortran(kappa, rmin, Rmaj)` gives the Fortran choice) and reports `D_half`,
 `converged` and `exit_reason` (`:tol`, `:plateau`, `:max_iter`) in its result.
 
-Together with `method=:pressure` (the `dpdr_crit` threshold used directly, instead of a
-critical *pressure* gradient derived from `dndr_crit` — which turns negative near the
-axis where the slowing-down density is flat and produced axial diffusivity spikes in the
-Fortran), these options remove the three pathologies found by J. Lestz in the original
-code. `method=:density` (the FUSE default) uses the density threshold directly and never
-had the axial spike.
+Together with feeding the TGLF-EP pressure threshold (`method=:pressure`, the
+`alpha_dpdr_crit.input` values used directly), these options remove the three pathologies
+found by J. Lestz in the original code. The axial diffusivity spike came from running the
+pressure drive on a critical pressure gradient *derived* from `alpha_dndr_crit.input`
+(`T·dndr·(1 + (ΔT/T)(n/Δn))`), which turns strongly negative where the slowing-down
+density is flat or hollow; supplying the dpdr file bypasses that translation. ALPHA.jl only
+performs the translation inside `method=:density`, where the stiff drive does not use it.
 
 ### Output — `AlphaResult`
 

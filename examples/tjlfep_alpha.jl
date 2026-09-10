@@ -49,7 +49,7 @@ println("=== ALPHA run_alpha ===")
 rho_full = collect(dd.core_profiles.profiles_1d[].grid.rho_tor_norm)
 # runTHD returns dpdr_crit in the TGLF-EP file units (10 kPa/m); ALPHA expects 10^19 m^-3·keV/m
 dpdr_crit = dpdr_crit ./ 0.16022
-res = run_alpha(dd, rho_full, (; dndr_crit, dpdr_crit); solver=:stiff, method=:density)
+res = run_alpha(dd, rho_full, (; dndr_crit, dpdr_crit); solver=:stiff, method=:pressure)
 
 @printf("ALPHA done. stiff_n_iter=%d stiff_error=%.3g exit=%s\n", res.stiff_n_iter, res.stiff_error, res.stiff_exit_reason)
 @printf("  n_EP    : min=%.4g max=%.4g [10^19 m^-3]\n", minimum(res.n_EP), maximum(res.n_EP))

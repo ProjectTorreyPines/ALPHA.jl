@@ -155,7 +155,9 @@ Read TGLF-EP critical-gradient files into the `crit_grad` argument accepted by
 With `convert_units=true` (default) the pressure gradient is returned in the package
 convention 10^19 m^-3·keV/m (file value / 0.16022), which is what `run_alpha` and
 `stiff_cgm_transport` expect (the FUSE `ActorTJLFEP` performs the same conversion).
-`convert_units=false` returns the raw file values.
+`convert_units=false` returns the raw file values. The Fortran `Alpha` reads the file
+without any conversion because its internal pressures are in 10 kPa as well; ALPHA.jl
+multiplies the package value back by 0.16022 internally, so both see the same threshold.
 
     crit_grad = load_crit_grad(; dndr="alpha_dndr_crit.input",
                                  dpdr="alpha_dpdr_crit.input")
@@ -215,7 +217,7 @@ Base.@kwdef struct AlphaResult{T<:Real}
     T_alpha_equiv::Vector{T}    # equivalent-Maxwellian slowing-down temperature [keV]
     E_c_hat::Vector{T}          # cross-over energy E_c/E_alpha
     S0::Vector{T}               # alpha source [10^19 m^-3 s^-1]
-    transport_active::Vector{Bool}  # where AE transport flattens the profile to marginal
+    transport_active::Vector{Bool}  # where AE transport flattens the profile (stiff: supercritical in the drive variable)
     # stiff-CGM diagnostics (when solver=:stiff)
     stiff_error::T
     stiff_n_iter::Int
@@ -363,8 +365,8 @@ end
 # public API
 # ──────────────────────────────────────────────────────────────────────────────
 """
-    run_alpha(dd, rho, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion, kwargs...) -> AlphaResult
-    run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:density, ep_mode=:fusion) -> AlphaResult
+    run_alpha(dd, rho, crit_grad; solver=:stiff, method=:pressure, ep_mode=:fusion, kwargs...) -> AlphaResult
+    run_alpha(input::AlphaInput, crit_grad; solver=:stiff, method=:pressure, ep_mode=:fusion) -> AlphaResult
 
 Integrate the TGLF-EP critical gradients into energetic-particle profiles.
 
@@ -381,8 +383,14 @@ Integrate the TGLF-EP critical gradients into energetic-particle profiles.
   * `:fusion_nbi` -- fusion alphas + pencil-beam NBI (`NBI_flag=2`).
 
 `method` (critical-gradient variable for the stiff threshold):
-  * `:density` -- use `dndr_crit` from TJLFEP.
-  * `:pressure` -- use `dpdr_crit` from TJLFEP.
+  * `:pressure` (default) -- EP pressure-gradient drive against `dpdr_crit`, the TGLF-EP
+    `alpha_dpdr_crit.input` threshold used as is (Fortran `i_tot_TAE=-1` fed the dpdr file).
+    This is the standard way to run Alpha.
+  * `:density` -- EP density-gradient drive against `dndr_crit` (Fortran `i_tot_TAE=0`), kept
+    for comparison. Do not emulate the pressure drive from `dndr_crit`: the critical pressure
+    gradient derived from it (`T·dndr·(1 + (ΔT/T)(n/Δn))`) is unreliable where the
+    slowing-down density is flat or hollow (it caused the axial diffusivity spikes found by
+    J. Lestz in the Fortran).
 
 `crit_grad` carries `dndr_crit` [10^19 m^-3/m] / `dpdr_crit` [10^19 m^-3·keV/m] on the same
 `rho` grid as TJLFEP outputs (the `alpha_dpdr_crit.input` file is 10 kPa/m: use
@@ -393,7 +401,7 @@ Stiff-solver options (interface-grid closure, max-normalisation, convergence) ar
 `transport_params::AlphaTransportParams`; see [`AlphaTransportParams`](@ref).
 """
 function run_alpha(dd::IMAS.dd, rho::AbstractVector, crit_grad; solver::Symbol=:stiff,
-                   method::Symbol=:density, ep_mode::Symbol=:fusion,
+                   method::Symbol=:pressure, ep_mode::Symbol=:fusion,
                    transport_params=nothing, nbi=nothing, ql_modes=nothing,
                    E_alpha::Real=3.5, Z1::Real=5 // 3, ln_lambda::Real=17)
     input = AlphaInput(dd, rho; E_alpha, Z1, ln_lambda)
@@ -401,10 +409,13 @@ function run_alpha(dd::IMAS.dd, rho::AbstractVector, crit_grad; solver::Symbol=:
 end
 
 function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
-                   method::Symbol=:density, ep_mode::Symbol=:fusion,
+                   method::Symbol=:pressure, ep_mode::Symbol=:fusion,
                    transport_params=nothing,
                    nbi::Union{Nothing,NBIBeamParams{T}}=nothing,
                    ql_modes=nothing) where {T<:Real}
+    method === :pressure && _getgrad(crit_grad, :dpdr_crit) === nothing &&
+        throw(ArgumentError("run_alpha(method=:pressure) requires `dpdr_crit` in crit_grad " *
+            "(TGLF-EP alpha_dpdr_crit.input / 0.16022, see load_crit_grad), or pass method=:density"))
     n_cl, T_equiv, E_c_hat, S0 = slowing_down(input.ne, input.Te, input.Ti, input.ni;
         E_alpha=input.E_alpha, Z1=input.Z1, ln_lambda=input.ln_lambda)
 
@@ -454,7 +465,7 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         T_EP = [n_EP[i] > eps(T) ? stiff.p_tran[i] / (n_EP[i] * _KEV19_TO_KPA) : T_equiv[i] for i in eachindex(n_EP)]
         p_EP = n_EP .* T_EP
         flux_particle = stiff.flux
-        transport_active = stiff.rg_p_tran .> stiff.rg_p_th .+ eps(T)
+        transport_active = _transport_active(stiff, tp.i_tot_TAE)
         D_alpha = stiff.D_alpha
         D_ql = stiff.D_ql
         stiff_error = stiff.error
@@ -474,7 +485,6 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
             p_EP = n_EP .* T_EP
         elseif method === :pressure
             dpdr = _as_T(T, _getgrad(crit_grad, :dpdr_crit))
-            dpdr === nothing && error("run_alpha(method=:pressure) requires `dpdr_crit` in crit_grad")
             p_cl = n_cl .* T_equiv
             p_marg = integrate_crit_grad(rmin, dpdr)
             p_EP = min.(p_cl, p_marg)
@@ -504,6 +514,17 @@ function run_alpha(input::AlphaInput{T}, crit_grad; solver::Symbol=:stiff,
         flux_particle, flux_energy,
         n_classical=n_cl, T_alpha_equiv=T_equiv, E_c_hat, S0, transport_active,
         stiff_error, stiff_n_iter, stiff_converged, stiff_exit_reason, D_alpha, D_ql, n_EP2, n_He)
+end
+
+"""
+Points where the stiff solution is supercritical in the drive variable the closure uses
+(`i_tot_TAE=0`: density gradient; otherwise pressure gradient). The `:density` branch also
+derives a pressure threshold from `dndr_crit`, which can turn negative near the axis and
+must not be used as the criterion there.
+"""
+function _transport_active(st::StiffCGMResult{T}, i_tot_TAE::Integer) where {T<:Real}
+    i_tot_TAE == 0 && return st.rg_n_tran .> st.rg_n_th .+ eps(T)
+    return st.rg_p_tran .> st.rg_p_th .+ eps(T)
 end
 
 _as_T(::Type{T}, ::Nothing) where {T} = nothing
